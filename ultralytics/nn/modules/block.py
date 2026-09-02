@@ -50,6 +50,7 @@ __all__ = (
     "PSA",
     "SCDown",
     "TorchVision",
+    "CrossScaleFusion",
 )
 
 
@@ -737,7 +738,15 @@ class C3k(C3):
     """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
-        """Initializes the C3k module with specified channels, number of layers, and configurations."""
+        """Initializes the C3k module with specified channels, number of layers, and configurations.
+    # c1(输入通道数)
+    # c2(输出通道数)
+    # n(子模块重复次数)
+    # shortcut(是否使用残差连接)
+    # g(groups, 分组卷积的组数)
+    # e(通道扩张比例)
+    # k(卷积核大小)
+        """
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)  # hidden channels
         # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
@@ -1367,3 +1376,132 @@ class A2C2f(nn.Module):
         if self.gamma is not None:
             return x + self.gamma.view(1, -1, 1, 1) * self.cv2(torch.cat(y, 1))
         return self.cv2(torch.cat(y, 1))
+
+
+class CrossScaleFusion(nn.Module):
+    """Detect
+    Cross-Scale Cross-Attention Residual Fusion (CSF) module.
+
+    Fuses a shallow (high-resolution) feature map into a deep (low-resolution) feature map via
+    multi-head cross attention. Two **independent** deep separable convolution paths generate
+    Key and Value from the raw shallow feature (before downsampling), while the deep feature
+    serves as Query. The attention output is projected back to the deep channel count with a
+    zero-initialized output projection and added to the deep feature as a residual signal, so
+    the module is an identity mapping at initialization.
+
+    This implements the large-span skip connection (e.g. P3 -> P5) described in the
+    "Cross-Scale Cross-Attention Residual Fusion" plan: adjacent-scale residual paths
+    (P3 -> P4, P4 -> P5) are kept untouched, and only the deep feature is refined.
+
+    Attributes:
+        c2 (int): Number of output channels (equals deep feature channels).
+        embed_dim (int): Unified embedding dimension for the attention computation.
+        num_heads (int): Number of attention heads.
+        head_dim (int): Dimension per attention head.
+
+    Methods:
+        forward: Performs the cross-scale cross-attention residual fusion.
+
+    Examples:
+        >>> import torch
+        >>> from ultralytics.nn.modules import CrossScaleFusion
+        >>> m = CrossScaleFusion(c1_shallow=256, c1_deep=1024, embed_dim=256, num_heads=8, num_blocks=2)
+        >>> shallow = torch.randn(1, 256, 80, 80)
+        >>> deep = torch.randn(1, 1024, 20, 20)
+        >>> out = m([shallow, deep])
+        >>> print(out.shape)  # (1, 1024, 20, 20)
+    """
+
+    def __init__(self, c1_shallow, c1_deep, embed_dim=256, num_heads=8, num_blocks=2, dropout=0.0):
+        """
+        Initializes the CrossScaleFusion module.
+
+        Args:
+            c1_shallow (int): Number of channels of the shallow (high-resolution) feature.
+            c1_deep (int): Number of channels of the deep (low-resolution) feature.
+            embed_dim (int): Unified embedding dimension for attention. Defaults to 256.
+            num_heads (int): Number of attention heads. Defaults to 8.
+            num_blocks (int): Number of stride-2 separable convolutions used to downsample the
+                shallow feature to the deep resolution (e.g. 2 for a 4x resolution gap). Defaults to 2.
+            dropout (float): Attention dropout probability. Defaults to 0.0.
+        """
+        super().__init__()
+        assert embed_dim % num_heads == 0, f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
+        self.c2 = c1_deep
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim**-0.5
+        self.dropout = dropout
+
+        # === Two independent deep separable convolution paths for K and V from raw shallow features ===
+        # Key path: processes shallow feature through independent depthwise separable convolutions
+        k_layers = []
+        in_ch = c1_shallow
+        for i in range(num_blocks):
+            # Depthwise separable conv: depthwise first, then pointwise to embed_dim
+            k_layers.append(DWConv(in_ch, in_ch, 3, 2, act=False))  # depthwise, stride=2 for downsampling
+            k_layers.append(Conv(in_ch, embed_dim, 1, 1, act=False))  # pointwise to embed_dim
+            in_ch = embed_dim
+        if num_blocks == 0:
+            k_layers = [Conv(c1_shallow, embed_dim, 1, 1, act=False)]
+        self.k_path = nn.Sequential(*k_layers)
+
+        # Value path: completely independent from Key path, same architecture
+        v_layers = []
+        in_ch = c1_shallow
+        for i in range(num_blocks):
+            # Depthwise separable conv: depthwise first, then pointwise to embed_dim
+            v_layers.append(DWConv(in_ch, in_ch, 3, 2, act=False))  # depthwise, stride=2 for downsampling
+            v_layers.append(Conv(in_ch, embed_dim, 1, 1, act=False))  # pointwise to embed_dim
+            in_ch = embed_dim
+        if num_blocks == 0:
+            v_layers = [Conv(c1_shallow, embed_dim, 1, 1, act=False)]
+        self.v_path = nn.Sequential(*v_layers)
+
+        self.q_proj = nn.Linear(c1_deep, embed_dim)
+        # K and V are already embed_dim after the separable conv paths; proj layers maintain interface compatibility
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, c1_deep)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x):
+        """
+        Fuses the shallow feature into the deep feature via cross-scale cross-attention.
+
+        Args:
+            x (list): A list containing the shallow and deep feature maps.
+                x[0] (torch.Tensor): Shallow feature map of shape (B, C1, H1, W1).
+                x[1] (torch.Tensor): Deep feature map of shape (B, C2, H2, W2).
+
+        Returns:
+            (torch.Tensor): Refined deep feature map of shape (B, C2, H2, W2).
+        """
+        shallow, deep = x
+        b, _, h2, w2 = deep.shape
+
+        # === K path: from raw shallow feature through independent separable conv path ===
+        k_out = self.k_path(shallow)  # (b, embed_dim, h2, w2) after downsampling to deep resolution
+        # === V path: from raw shallow feature through independent separable conv path (same architecture, independent weights) ===
+        v_out = self.v_path(shallow)  # (b, embed_dim, h2, w2) after downsampling to deep resolution
+
+        kv = k_out.flatten(2).transpose(1, 2)  # (b, n, embed_dim) where n = h2*w2
+        q = self.q_proj(deep.flatten(2).transpose(1, 2))  # (b, m, embed_dim) where m = h2*w2
+        k = self.k_proj(kv)  # (b, n, embed_dim)
+        v = self.v_proj(v_out.flatten(2).transpose(1, 2))  # (b, n, embed_dim)
+
+        q = q.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2)  # (b, h, m, d)
+        k = k.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2)  # (b, h, n, d)
+        v = v.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2)  # (b, h, n, d)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (b, h, m, n)
+        attn = attn.softmax(dim=-1)
+        if self.dropout > 0:
+            attn = F.dropout(attn, p=self.dropout, training=self.training)
+
+        out = (attn @ v).transpose(1, 2).reshape(b, -1, self.embed_dim)  # (b, m, embed_dim)
+        out = self.out_proj(out)  # (b, m, c1_deep)
+        out = out.transpose(1, 2).view(b, self.c2, h2, w2)  # (b, c1_deep, h2, w2)
+        return deep + out

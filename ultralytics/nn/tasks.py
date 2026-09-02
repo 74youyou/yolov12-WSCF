@@ -65,6 +65,7 @@ from ultralytics.nn.modules import (
     WorldDetect,
     v10Detect,
     A2C2f,
+    CrossScaleFusion,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -272,10 +273,58 @@ class BaseModel(nn.Module):
         """
         model = weights["model"] if isinstance(weights, dict) else weights  # torchvision models are not dicts
         csd = model.float().state_dict()  # checkpoint state_dict as FP32
+        csd = self._remap_shifted_layers(csd, self.state_dict())  # handle layer index shift from inserted modules (e.g. CrossScaleFusion)
         csd = intersect_dicts(csd, self.state_dict())  # intersect
         self.load_state_dict(csd, strict=False)  # load
         if verbose:
             LOGGER.info(f"Transferred {len(csd)}/{len(self.model.state_dict())} items from pretrained weights")
+
+    @staticmethod
+    def _remap_shifted_layers(csd, cur):
+        """
+        Remap checkpoint state-dict keys when extra layers have been inserted into the current architecture.
+
+        Each layer of the checkpoint and of the current model is fingerprinted by its parameter/buffer
+        names and shapes, and the two layer sequences are aligned with a longest-matching-subsequence
+        algorithm. Checkpoint keys are then remapped onto their aligned counterpart in the current model,
+        so e.g. a Detect head shifted from 'model.21' to 'model.22' by an inserted CrossScaleFusion layer
+        still receives its pretrained weights. Newly inserted modules have no checkpoint counterparts and
+        keep their (zero-)initialized weights. If layer counts match, the checkpoint is returned unchanged.
+        """
+        import difflib
+
+        def group_by_layer(sd):
+            d = {}
+            for k in sd:
+                p = k.split(".")
+                if p[0] == "model":
+                    d.setdefault(int(p[1]), []).append(k)
+            return d
+
+        def fingerprint(keys, sd, idx):
+            return tuple(sorted((k.split(".", 2)[2], tuple(sd[k].shape)) for k in keys[idx]))
+
+        ck, cu = group_by_layer(csd), group_by_layer(cur)
+        ck_idx, cu_idx = sorted(ck), sorted(cu)
+        if not ck_idx or len(ck_idx) == len(cu_idx):
+            return csd
+        ck_seq = [fingerprint(ck, csd, i) for i in ck_idx]
+        cu_seq = [fingerprint(cu, cur, i) for i in cu_idx]
+        idx_map = {}
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ck_seq, cu_seq, autojunk=False).get_opcodes():
+            if tag == "equal":
+                for di in range(i2 - i1):
+                    idx_map[ck_idx[i1 + di]] = cu_idx[j1 + di]
+        if not idx_map or all(k == idx_map[k] for k in idx_map):
+            return csd
+        out = {}
+        for k, v in csd.items():
+            parts = k.split(".")
+            if parts[0] == "model" and int(parts[1]) in idx_map:
+                out[f"model.{idx_map[int(parts[1])]}.{'.'.join(parts[2:])}"] = v
+            else:
+                out[k] = v
+        return out
 
     def loss(self, batch, preds=None):
         """
@@ -1064,6 +1113,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
+        elif m is CrossScaleFusion:  # multi-input module: [shallow_idx, deep_idx]
+            c1_s, c1_d = ch[f[0]], ch[f[1]]
+            args[0] = make_divisible(min(args[0], max_channels) * width, 8)  # embed dim
+            args[1] = max(round(args[1] * width), 1)  # num heads
+            args = [c1_s, c1_d, *args]
         else:
             c2 = ch[f]
 
