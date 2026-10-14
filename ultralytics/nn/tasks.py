@@ -66,6 +66,8 @@ from ultralytics.nn.modules import (
     v10Detect,
     A2C2f,
     CrossScaleFusion,
+    WaveletBranch,
+    P1WaveletFusion,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1113,11 +1115,19 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
+        elif m is WaveletBranch:  # wavelet branch: raw image -> (W1, W2, W3), each 4*in_ch channels
+            args = [ch[f], *args]  # prepend input channels (3)
+            c2 = 4 * args[0]  # each output is the concatenation of the 4 (GRN-scaled) sub-bands
+        elif m is P1WaveletFusion:  # multi-input module: [p1_idx, w1_idx], optional args [c_w1_proj, use_act]
+            c1_p1, c1_w1 = (ch[x] for x in f)
+            args = [c1_p1, c1_w1, *args]
+            c2 = c1_p1
         elif m is CrossScaleFusion:  # multi-input module: [shallow_idx, deep_idx]
             c1_s, c1_d = ch[f[0]], ch[f[1]]
             args[0] = make_divisible(min(args[0], max_channels) * width, 8)  # embed dim
             args[1] = max(round(args[1] * width), 1)  # num heads
             args = [c1_s, c1_d, *args]
+            c2 = c1_d
         else:
             c2 = ch[f]
 
