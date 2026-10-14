@@ -1,0 +1,79 @@
+# 1. 基础镜像：NVIDIA 官方 CUDA 11.8 + cuDNN 8 + Ubuntu 22.04
+#    说明：原 20.04 方案无法直接安装 python3.11（需 deadsnakes PPA，但 launchpad 网络极慢，
+#    且 cuda-toolkit-11-8 不包含 cuDNN，torch cu118 运行时需要 libcudnn.so.8）。
+#    该镜像自带 CUDA 11.8 完整工具链（含 nvcc）与 cuDNN 8，与 flash_attn(cu11) / torch(cu118) 完全匹配。
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+
+# 2. 环境变量设置（含义见原 Dockerfile 注释）
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    MKL_THREADING_LAYER=GNU \
+    OMP_NUM_THREADS=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    TZ=Asia/Shanghai
+
+# 3. apt 换 TUNA 国内源 + 启用 universe + 安装基础系统依赖（含 Python 3.11 及开发文件）
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' /etc/apt/sources.list 2>/dev/null; \
+    find /etc/apt/sources.list.d -name '*.sources' -exec sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' {} + 2>/dev/null; \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        software-properties-common ca-certificates && \
+    add-apt-repository -y universe && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gcc git zip unzip wget curl htop \
+        libgl1 libglib2.0-0 libpython3-dev \
+        gnupg g++ libusb-1.0-0 libsm6 \
+        python3.11 python3.11-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 4. 安装 pip（针对 Python 3.11；Ubuntu 系统 Python 的 ensurepip 被禁用，故用 get-pip.py）
+RUN curl -sSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && \
+    python3.11 /tmp/get-pip.py && \
+    rm -f /tmp/get-pip.py
+
+# 5. 将 Python 3.11 设置为默认 Python（系统级）
+RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python && \
+    ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+
+# 6a. 下载 PyTorch 2.2.2 + torchvision 0.17.2 wheel（CUDA 11.8 版本，SJTU 镜像源，失败时回退官方源）
+#     单独一层，下载成功后不会因后续安装失败而重复下载
+RUN curl -L -o /tmp/torch-2.2.2+cu118-cp311-cp311-linux_x86_64.whl "https://mirror.sjtu.edu.cn/pytorch-wheels/cu118/torch-2.2.2%2Bcu118-cp311-cp311-linux_x86_64.whl" || curl -L -o /tmp/torch-2.2.2+cu118-cp311-cp311-linux_x86_64.whl "https://download.pytorch.org/whl/cu118/torch-2.2.2%2Bcu118-cp311-cp311-linux_x86_64.whl" && \
+    curl -L -o /tmp/torchvision-0.17.2+cu118-cp311-cp311-linux_x86_64.whl "https://mirror.sjtu.edu.cn/pytorch-wheels/cu118/torchvision-0.17.2%2Bcu118-cp311-cp311-linux_x86_64.whl" || curl -L -o /tmp/torchvision-0.17.2+cu118-cp311-cp311-linux_x86_64.whl "https://download.pytorch.org/whl/cu118/torchvision-0.17.2%2Bcu118-cp311-cp311-linux_x86_64.whl"
+
+# 6b. 安装 torch + torchvision + numpy（pip 使用 TUNA 镜像源，加长超时与重试，避免网络抖动失败）
+RUN python -m pip install --no-cache-dir --upgrade pip && \
+    python -m pip install --no-cache-dir --timeout 60 --retries 10 -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        /tmp/torch-2.2.2+cu118-cp311-cp311-linux_x86_64.whl \
+        /tmp/torchvision-0.17.2+cu118-cp311-cp311-linux_x86_64.whl \
+        numpy==1.26.4 && \
+    rm -f /tmp/torch-2.2.2+cu118-cp311-cp311-linux_x86_64.whl /tmp/torchvision-0.17.2+cu118-cp311-cp311-linux_x86_64.whl
+
+# 7. 设置工作目录（对应挂载点，运行时挂载项目源码到该目录）
+WORKDIR /yolov12Project_workspace
+
+# 8. 拷贝 requirements.txt 和 flash_attn wheel 到临时目录
+COPY myDockerFile/requirements.txt /var/tmp/requirements.txt
+COPY myDockerFile/flash_attn-2.7.3+cu11torch2.2cxx11abiFALSE-cp311-cp311-linux_x86_64.whl /var/tmp/
+
+# 9. 安装项目依赖（requirements.txt 已包含 flash_attn wheel 与 supervision，安装后清理安装文件）
+#    注意：pip 将 requirements.txt 中相对路径按“当前工作目录”解析，故先 cd 到 wheel 所在目录
+RUN cd /var/tmp && \
+    python -m pip install --no-cache-dir --timeout 60 --retries 10 -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        -r /var/tmp/requirements.txt && \
+    rm -f /var/tmp/requirements.txt /var/tmp/flash_attn-2.7.3+cu11torch2.2cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+
+# 9b. 补充 ultralytics 运行时依赖（YOLOv12 fork 在 ultralytics/utils/torch_utils.py 顶层 import thop，requirements.txt 未包含）
+RUN python -m pip install --no-cache-dir --timeout 60 --retries 10 -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        ultralytics-thop
+
+# 10. 添加镜像元数据标签（突出开发环境）
+LABEL maintainer="your-email@example.com" \
+      description="YOLOv12 development environment with CUDA 11.8, Python 3.11, PyTorch 2.2.2" \
+      version="1.0" \
+      environment="development"
+
+# 11. 默认启动命令
+CMD ["/bin/bash"]

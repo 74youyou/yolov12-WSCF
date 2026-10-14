@@ -2,3 +2,9 @@
 
 *.jpg
 /datasets/
+/myDockerFile/flash_attn-2.7.3+cu11torch2.2cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+/AccessKey.csv
+/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+/flash_attn-2.7.4%2Bcu124torch2.6.0cxx11abiFALSE-cp311-cp311-win_amd64.whl
+/torch-2.6.0+cu124-cp311-cp311-linux_x86_64.whl
+/torch-2.6.0+cu124-cp311-cp311-win_amd64.whl

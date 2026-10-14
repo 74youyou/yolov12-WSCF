@@ -1,0 +1,56 @@
+# YOLOv12 🚀, AGPL-3.0 license
+# YOLOv12-CSF (Cross-Scale Cross-Attention Residual Fusion) object detection model with P3-P5 outputs.
+# Based on YOLOv12-turbo: identical backbone/head/loss, with an extra large-span skip connection
+# P3 -> P5 inserted before the Detect head. The adjacent-scale fusion paths (P3->P4, P4->P5) are kept unchanged.
+
+# Parameters
+nc: 80 # number of classes
+scales: # model compound scaling constants, i.e. 'model=yolov12-csf.yaml' will call this yaml with scale 'n'
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024] # summary: 497 layers, 2,553,904 parameters, 2,553,888 gradients, 6.2 GFLOPs
+  s: [0.50, 0.50, 1024] # summary: 497 layers, 9,127,424 parameters, 9,127,408 gradients, 19.7 GFLOPs
+  m: [0.50, 1.00, 512] # summary: 533 layers, 19,670,784 parameters, 19,670,768 gradients, 60.4 GFLOPs
+  l: [1.00, 1.00, 512] # summary: 895 layers, 26,506,496 parameters, 26,506,480 gradients, 83.3 GFLOPs
+  x: [1.00, 1.50, 512] # summary: 895 layers, 59,414,176 parameters, 59,414,160 gradients, 185.9 GFLOPs
+
+# YOLO12-turbo backbone (modified: 插入两个 CSF)
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv,  [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv,  [128, 3, 2, 1, 2]] # 1-P2/4
+  - [-1, 2, C3k2,  [256, False, 0.25]] # 2
+  - [-1, 1, Conv,  [256, 3, 2, 1, 4]] # 3-P3/8
+
+  # 新增：在 P3 后插入 CSF，融合 P1（层0）和 P3（层3）
+  - [[0, 3], 1, CrossScaleFusion, [512, 8, 2, 0.0]] # 4: CSF P1 -> P3
+
+  - [-1, 2, C3k2,  [512, False, 0.25]] # 5 (原层4)
+  - [-1, 1, Conv,  [512, 3, 2]] # 6-P4/16 (原层5)
+  - [-1, 4, A2C2f, [512, True, 4]] # 7 (原层6)
+  - [-1, 1, Conv,  [1024, 3, 2]] # 8-P5/32 (原层7)
+
+  # 新增：在 P5 后插入 CSF，融合 P3（层3）和 P5（层8）
+  - [[4, 8], 1, CrossScaleFusion, [512, 8, 2, 0.0]] # 9: CSF P3 -> P5
+
+  - [-1, 4, A2C2f, [1024, True, 1]] # 10 (原层8)
+
+# YOLO12-turbo head + CrossScaleFusion (P3 -> P5) (保留原 head 末尾的 CSF)
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 11
+  - [[-1, 7], 1, Concat, [1]] # 12 cat backbone P4 (原层6->新层7)
+  - [-1, 2, A2C2f, [512, False, -1]] # 13 (原层11)
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 14
+  - [[-1, 5], 1, Concat, [1]] # 15 cat backbone P3 (原层4->新层5)
+  - [-1, 2, A2C2f, [256, False, -1]] # 16 (P3/8-small) (原层14)
+
+  - [-1, 1, Conv, [256, 3, 2]] # 17
+  - [[-1, 13], 1, Concat, [1]] # 18 cat head P4 (原层11->新层13)
+  - [-1, 2, A2C2f, [512, False, -1]] # 19 (P4/16-medium) (原层17)
+
+  - [-1, 1, Conv, [512, 3, 2]] # 20
+  - [[-1, 10], 1, Concat, [1]] # 21 cat head P5 (原层8->新层10)
+  - [-1, 2, C3k2, [1024, True]] # 22 (P5/32-large) (原层20)
+
+
+  - [[16, 19, 22], 1, Detect, [nc]] # 24 Detect(P3, P4, P5) (原层22)
