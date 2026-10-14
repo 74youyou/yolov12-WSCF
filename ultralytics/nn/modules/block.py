@@ -51,13 +51,6 @@ __all__ = (
     "SCDown",
     "TorchVision",
     "CrossScaleFusion",
-    "WaveletBranch",
-    "WaveletLevelBlock",
-    "SubbandGRNv3",
-    "LocalSubbandEnergy",
-    "SpatialSubbandGate",
-    "SpatialWaveletLevelBlock",
-    "P1WaveletFusion",
 )
 
 
@@ -1386,479 +1379,129 @@ class A2C2f(nn.Module):
 
 
 class CrossScaleFusion(nn.Module):
-    """Cross-Scale Cross-Attention Residual Fusion (CSF) with local window attention.
+    """Detect
+    Cross-Scale Cross-Attention Residual Fusion (CSF) module.
 
-    Fuses a shallow (high-resolution) feature map into a deep (low-resolution) feature map. The shallow
-    feature keeps its full resolution (2x the deep) and produces Key/Value per-pixel via two independent
-    depthwise-separable paths. Each deep position acts as a Query and attends only to the 3x3 window of
-    shallow positions centered at ``(2i, 2j)`` (9 candidates, extracted with ``F.unfold`` and stride 2). The
-    attention output is projected back to the deep channel count with a zero-initialized projection and
-    added as a residual, so the module is an identity mapping at initialization.
+    Fuses a shallow (high-resolution) feature map into a deep (low-resolution) feature map via
+    multi-head cross attention. Two **independent** deep separable convolution paths generate
+    Key and Value from the raw shallow feature (before downsampling), while the deep feature
+    serves as Query. The attention output is projected back to the deep channel count with a
+    zero-initialized output projection and added to the deep feature as a residual signal, so
+    the module is an identity mapping at initialization.
 
-    The shallow spatial size must be exactly 2x the deep spatial size (stride = 2). The module is generic
-    and can be reused for any such pair (e.g. W2->P3, W3->P4, W4->P5).
+    This implements the large-span skip connection (e.g. P3 -> P5) described in the
+    "Cross-Scale Cross-Attention Residual Fusion" plan: adjacent-scale residual paths
+    (P3 -> P4, P4 -> P5) are kept untouched, and only the deep feature is refined.
 
     Attributes:
         c2 (int): Number of output channels (equals deep feature channels).
         embed_dim (int): Unified embedding dimension for the attention computation.
         num_heads (int): Number of attention heads.
         head_dim (int): Dimension per attention head.
-        window_size (int): Window side length (fixed to 3).
-        stride (int): Downsampling factor from shallow to deep (fixed to 2).
 
     Methods:
-        forward: Performs the windowed cross-scale cross-attention residual fusion.
+        forward: Performs the cross-scale cross-attention residual fusion.
 
     Examples:
         >>> import torch
         >>> from ultralytics.nn.modules import CrossScaleFusion
-        >>> m = CrossScaleFusion(c1_shallow=12, c1_deep=64, embed_dim=64, num_heads=4)
-        >>> shallow = torch.randn(1, 12, 160, 160)
-        >>> deep = torch.randn(1, 64, 80, 80)
+        >>> m = CrossScaleFusion(c1_shallow=256, c1_deep=1024, embed_dim=256, num_heads=8, num_blocks=2)
+        >>> shallow = torch.randn(1, 256, 80, 80)
+        >>> deep = torch.randn(1, 1024, 20, 20)
         >>> out = m([shallow, deep])
-        >>> print(out.shape)  # (1, 64, 80, 80)
+        >>> print(out.shape)  # (1, 1024, 20, 20)
     """
 
-    def __init__(self, c1_shallow, c1_deep, embed_dim=64, num_heads=4, window_size=3, stride=2, dropout=0.0):
+    def __init__(self, c1_shallow, c1_deep, embed_dim=256, num_heads=8, num_blocks=2, dropout=0.0):
         """
-        Initializes the windowed CrossScaleFusion module.
+        Initializes the CrossScaleFusion module.
 
         Args:
             c1_shallow (int): Number of channels of the shallow (high-resolution) feature.
             c1_deep (int): Number of channels of the deep (low-resolution) feature.
-            embed_dim (int): Unified embedding dimension for attention. Defaults to 64.
-            num_heads (int): Number of attention heads. Defaults to 4.
-            window_size (int): Window side length. Fixed to 3 (odd). Defaults to 3.
-            stride (int): Downsampling factor from shallow to deep. Fixed to 2. Defaults to 2.
+            embed_dim (int): Unified embedding dimension for attention. Defaults to 256.
+            num_heads (int): Number of attention heads. Defaults to 8.
+            num_blocks (int): Number of stride-2 separable convolutions used to downsample the
+                shallow feature to the deep resolution (e.g. 2 for a 4x resolution gap). Defaults to 2.
             dropout (float): Attention dropout probability. Defaults to 0.0.
         """
         super().__init__()
         assert embed_dim % num_heads == 0, f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})."
-        assert window_size % 2 == 1, f"window_size ({window_size}) must be odd."
-        assert stride == 2, f"stride must be 2, got {stride}."
         self.c2 = c1_deep
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.scale = self.head_dim**-0.5
-        self.window_size = window_size
-        self.pad = window_size // 2
-        self.stride = stride
         self.dropout = dropout
 
-        # K/V paths keep the shallow feature at full resolution (2H x 2W): depthwise 3x3 + pointwise to embed_dim
-        self.k_path = nn.Sequential(
-            DWConv(c1_shallow, c1_shallow, 3, 1, act=True),
-            Conv(c1_shallow, embed_dim, 1, 1, act=True),
-        )
-        self.v_path = nn.Sequential(
-            DWConv(c1_shallow, c1_shallow, 3, 1, act=True),
-            Conv(c1_shallow, embed_dim, 1, 1, act=True),
-        )
+        # === Two independent deep separable convolution paths for K and V from raw shallow features ===
+        # Key path: processes shallow feature through independent depthwise separable convolutions
+        k_layers = []
+        in_ch = c1_shallow
+        for i in range(num_blocks):
+            # Depthwise separable conv: depthwise first, then pointwise to embed_dim
+            k_layers.append(DWConv(in_ch, in_ch, 3, 2, act=False))  # depthwise, stride=2 for downsampling
+            k_layers.append(Conv(in_ch, embed_dim, 1, 1, act=False))  # pointwise to embed_dim
+            in_ch = embed_dim
+        if num_blocks == 0:
+            k_layers = [Conv(c1_shallow, embed_dim, 1, 1, act=False)]
+        self.k_path = nn.Sequential(*k_layers)
+
+        # Value path: completely independent from Key path, same architecture
+        v_layers = []
+        in_ch = c1_shallow
+        for i in range(num_blocks):
+            # Depthwise separable conv: depthwise first, then pointwise to embed_dim
+            v_layers.append(DWConv(in_ch, in_ch, 3, 2, act=False))  # depthwise, stride=2 for downsampling
+            v_layers.append(Conv(in_ch, embed_dim, 1, 1, act=False))  # pointwise to embed_dim
+            in_ch = embed_dim
+        if num_blocks == 0:
+            v_layers = [Conv(c1_shallow, embed_dim, 1, 1, act=False)]
+        self.v_path = nn.Sequential(*v_layers)
 
         self.q_proj = nn.Linear(c1_deep, embed_dim)
+        # K and V are already embed_dim after the separable conv paths; proj layers maintain interface compatibility
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, c1_deep)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x):
         """
-        Fuses the shallow feature into the deep feature via windowed cross-scale cross-attention.
+        Fuses the shallow feature into the deep feature via cross-scale cross-attention.
 
         Args:
-            x (list): ``x[0]`` shallow feature (B, C1, 2H, 2W), ``x[1]`` deep feature (B, C2, H, W).
+            x (list): A list containing the shallow and deep feature maps.
+                x[0] (torch.Tensor): Shallow feature map of shape (B, C1, H1, W1).
+                x[1] (torch.Tensor): Deep feature map of shape (B, C2, H2, W2).
 
         Returns:
-            (torch.Tensor): Refined deep feature of shape (B, C2, H, W).
+            (torch.Tensor): Refined deep feature map of shape (B, C2, H2, W2).
         """
         shallow, deep = x
-        B, C2, H, W = deep.shape
-        N = H * W
-        C = self.embed_dim
-        r = self.window_size
-        H1, W1 = shallow.shape[-2:]
-        assert H1 == 2 * H and W1 == 2 * W, f"shallow ({H1}x{W1}) must be 2x deep ({H}x{W})."
+        b, _, h2, w2 = deep.shape
 
-        # 1. K/V at full shallow resolution
-        k_feat = self.k_path(shallow)  # (B, C, 2H, 2W)
-        v_feat = self.v_path(shallow)  # (B, C, 2H, 2W)
+        # === K path: from raw shallow feature through independent separable conv path ===
+        k_out = self.k_path(shallow)  # (b, embed_dim, h2, w2) after downsampling to deep resolution
+        # === V path: from raw shallow feature through independent separable conv path (same architecture, independent weights) ===
+        v_out = self.v_path(shallow)  # (b, embed_dim, h2, w2) after downsampling to deep resolution
 
-        # 2. Extract r x r windows with stride 2 -> (B, C*r*r, N)
-        k_unf = F.unfold(k_feat, kernel_size=r, padding=self.pad, stride=self.stride)
-        v_unf = F.unfold(v_feat, kernel_size=r, padding=self.pad, stride=self.stride)
+        kv = k_out.flatten(2).transpose(1, 2)  # (b, n, embed_dim) where n = h2*w2
+        q = self.q_proj(deep.flatten(2).transpose(1, 2))  # (b, m, embed_dim) where m = h2*w2
+        k = self.k_proj(kv)  # (b, n, embed_dim)
+        v = self.v_proj(v_out.flatten(2).transpose(1, 2))  # (b, n, embed_dim)
 
-        # 3. Reshape to (B, N, r*r, C)
-        k_win = k_unf.view(B, C, r * r, N).permute(0, 3, 2, 1).contiguous()  # (B, N, 9, C)
-        v_win = v_unf.view(B, C, r * r, N).permute(0, 3, 2, 1).contiguous()  # (B, N, 9, C)
+        q = q.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2)  # (b, h, m, d)
+        k = k.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2)  # (b, h, n, d)
+        v = v.view(b, -1, self.num_heads, self.head_dim).transpose(1, 2)  # (b, h, n, d)
 
-        # 4. Query from deep
-        q = self.q_proj(deep.flatten(2).transpose(1, 2))  # (B, N, C)
-
-        # 5. Multi-head reshape
-        q = q.view(B, N, 1, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B, h, N, 1, d)
-        k_win = k_win.view(B, N, r * r, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B, h, N, 9, d)
-        v_win = v_win.view(B, N, r * r, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B, h, N, 9, d)
-
-        # 6. Local cross attention
-        attn = (q @ k_win.transpose(-2, -1)) * self.scale  # (B, h, N, 1, 9)
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (b, h, m, n)
         attn = attn.softmax(dim=-1)
         if self.dropout > 0:
             attn = F.dropout(attn, p=self.dropout, training=self.training)
 
-        out = (attn @ v_win).squeeze(3)  # (B, h, N, d)
-        out = out.permute(0, 2, 1, 3).reshape(B, N, C)  # (B, N, C)
-
-        # 7. Output projection + residual
-        out = self.out_proj(out)  # (B, N, C2)
-        out = out.transpose(1, 2).view(B, C2, H, W)  # (B, C2, H, W)
+        out = (attn @ v).transpose(1, 2).reshape(b, -1, self.embed_dim)  # (b, m, embed_dim)
+        out = self.out_proj(out)  # (b, m, c1_deep)
+        out = out.transpose(1, 2).view(b, self.c2, h2, w2)  # (b, c1_deep, h2, w2)
         return deep + out
-
-
-class SubbandGRNv3(nn.Module):
-    """Subband-level GRN-v3 that predicts per-sub-band scaling weights from the raw image.
-
-    The input is the **raw image** ``x`` of shape (B, in_ch, H, W) (not the concatenated sub-bands). The
-    module produces ``n_bands`` groups of per-channel scaling weights of shape (B, band_ch, 1, 1), one group
-    for each wavelet sub-band (LL, LH, HL, HH). The caller applies each group to the corresponding sub-band.
-
-    The scaling is ``scale = b + fc2(ReLU(fc1(GAP(x))))`` where ``b`` is a fixed per-channel bias
-    initialized to ones and the dynamic branch ``fc2`` is zero-initialized, so at initialization
-    ``scale == 1`` (identity scaling).
-
-    Examples:
-        >>> import torch
-        >>> from ultralytics.nn.modules import SubbandGRNv3
-        >>> m = SubbandGRNv3(in_ch=3, n_bands=4, band_ch=3)
-        >>> scale = m(torch.randn(1, 3, 64, 64))
-        >>> print(scale.shape)  # (1, 12, 1, 1)
-    """
-
-    def __init__(self, in_ch=3, n_bands=4, band_ch=None, hidden_ratio=0.25):
-        """
-        Initializes the subband-level GRN-v3 module.
-
-        Args:
-            in_ch (int): Number of channels of the raw image input. Defaults to 3.
-            n_bands (int): Number of sub-bands. Defaults to 4 (LL, LH, HL, HH).
-            band_ch (int | None): Number of channels per sub-band (C_in). Defaults to ``in_ch``.
-            hidden_ratio (float): Hidden width ratio of the bottleneck MLP. Defaults to 0.25.
-        """
-        super().__init__()
-        self.n_bands = n_bands
-        self.band_ch = band_ch if band_ch is not None else in_ch
-        total = n_bands * self.band_ch
-
-        hidden = max(1, int(total * hidden_ratio))
-        self.fc1 = nn.Conv2d(in_ch, hidden, 1)
-        self.act = nn.ReLU(inplace=True)
-        self.fc2 = nn.Conv2d(hidden, total, 1)
-
-        # Fixed baseline scaling, initialized to 1; dynamic branch fc2 is zero -> scale = 1 at init
-        self.b = nn.Parameter(torch.ones(1, total, 1, 1))
-        nn.init.zeros_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
-
-    def forward(self, x):
-        """
-        Predicts the per-sub-band scaling weights from the raw image.
-
-        Args:
-            x (torch.Tensor): Raw image of shape (B, in_ch, H, W).
-
-        Returns:
-            (torch.Tensor): Scaling weights of shape (B, n_bands * band_ch, 1, 1), to be split into
-                ``n_bands`` groups of ``band_ch`` channels by the caller.
-        """
-        ctx = F.adaptive_avg_pool2d(x, 1)  # (B, in_ch, 1, 1)
-        w = self.fc2(self.act(self.fc1(ctx)))  # (B, total, 1, 1)
-        return self.b + w  # (B, total, 1, 1)
-
-
-class WaveletLevelBlock(nn.Module):
-    """Applies GRN-v3 weights (predicted from the raw image) to one level's sub-bands and concatenates them.
-
-    Pipeline::
-
-        raw image -> SubbandGRNv3 -> four per-channel scaling groups (one per sub-band)
-        (LL, LH, HL, HH) -> scale each sub-band by its group -> cat([LL', LH', HL', HH'], dim=1)
-
-    No projection is applied: the concatenated scaled sub-bands are returned directly and consumed by the
-    downstream fusion paths (``P1WaveletFusion`` for W1, ``CrossScaleFusion`` as K/V for W2/W3). The GRN-v3
-    is identity at initialization (``scale == 1``), so the block returns the raw sub-bands at init.
-
-    Examples:
-        >>> import torch
-        >>> from ultralytics.nn.modules import WaveletLevelBlock
-        >>> m = WaveletLevelBlock(in_ch=3)
-        >>> bands = [torch.randn(1, 3, 64, 64) for _ in range(4)]
-        >>> print(m(bands, torch.randn(1, 3, 256, 256)).shape)  # (1, 12, 64, 64)
-    """
-
-    def __init__(self, in_ch, use_grn=True, hidden_ratio=0.25):
-        """
-        Initializes the wavelet level block.
-
-        Args:
-            in_ch (int): Number of channels per input sub-band.
-            use_grn (bool): Whether to apply the SubbandGRNv3 dynamic scaling. Defaults to True.
-            hidden_ratio (float): Hidden width ratio of the GRN bottleneck. Defaults to 0.25.
-        """
-        super().__init__()
-        self.in_ch = in_ch
-        self.use_grn = use_grn
-
-        if use_grn:
-            self.grn = SubbandGRNv3(in_ch=in_ch, n_bands=4, band_ch=in_ch, hidden_ratio=hidden_ratio)
-
-    def forward(self, subbands, image):
-        """
-        Scales one level of wavelet sub-bands using weights predicted from the raw image.
-
-        Args:
-            subbands (tuple[torch.Tensor, ...]): ``(ll, lh, hl, hh)``, each of shape (B, in_ch, H, W).
-            image (torch.Tensor): Raw image used to predict the weights, shape (B, in_ch, H_img, W_img).
-
-        Returns:
-            (torch.Tensor): Concatenated scaled sub-bands of shape (B, 4*in_ch, H, W).
-        """
-        ll, lh, hl, hh = subbands
-
-        if self.use_grn:
-            scale = self.grn(image)  # (B, 4*in_ch, 1, 1)
-            s_ll, s_lh, s_hl, s_hh = torch.split(scale, self.in_ch, dim=1)  # each (B, in_ch, 1, 1)
-            ll = ll * s_ll
-            lh = lh * s_lh
-            hl = hl * s_hl
-            hh = hh * s_hh
-
-        return torch.cat([ll, lh, hl, hh], dim=1)  # (B, 4*in_ch, H, W)
-
-
-class LocalSubbandEnergy(nn.Module):
-    """FP32 log1p local mean-square energy for the four ordered RGB Haar bands."""
-
-    def __init__(self, kernel_size=3):
-        super().__init__()
-        if not isinstance(kernel_size, int) or kernel_size < 1 or kernel_size % 2 != 1:
-            raise ValueError("kernel_size must be a positive odd integer")
-        self.kernel_size = kernel_size
-
-    def forward(self, x):
-        if x.ndim != 4 or x.shape[1] != 12:
-            raise ValueError(f"expected (B, 12, H, W), got {tuple(x.shape)}")
-        b, _, h, w = x.shape
-        # Squaring half-precision Haar coefficients can overflow before log1p.
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            bands = x.float().reshape(b, 4, 3, h, w)
-            energy = bands.square().mean(dim=2)
-            pad = self.kernel_size // 2
-            if pad:
-                mode = "reflect" if h > pad and w > pad else "replicate"
-                energy = F.pad(energy, (pad, pad, pad, pad), mode=mode)
-                energy = F.avg_pool2d(energy, self.kernel_size, stride=1)
-            return torch.log1p(energy)
-
-
-class SpatialSubbandGate(nn.Module):
-    """One bounded spatial weight per band, shared across that band's RGB channels."""
-
-    def __init__(self, hidden_channels=16, beta=0.2):
-        super().__init__()
-        if hidden_channels < 1 or not 0 <= beta < 1:
-            raise ValueError("hidden_channels must be positive and beta must be in [0, 1)")
-        self.beta = beta
-        self.conv1 = nn.Conv2d(4, hidden_channels, 3, padding=1)
-        self.act = nn.SiLU()
-        self.conv2 = nn.Conv2d(hidden_channels, 4, 1)
-        nn.init.zeros_(self.conv2.weight)
-        nn.init.zeros_(self.conv2.bias)
-
-    def weights(self, energy):
-        if energy.ndim != 4 or energy.shape[1] != 4:
-            raise ValueError(f"expected (B, 4, H, W), got {tuple(energy.shape)}")
-        # LocalSubbandEnergy stays FP32, but validation can run this module in FP16 without autocast.
-        gate_input = energy.to(dtype=self.conv1.weight.dtype)
-        logits = self.conv2(self.act(self.conv1(gate_input)))
-        return 1.0 + self.beta * torch.tanh(logits.float())
-
-    def forward(self, x, energy):
-        if x.ndim != 4 or x.shape[1] != 12 or x.shape[0] != energy.shape[0] or x.shape[-2:] != energy.shape[-2:]:
-            raise ValueError("wavelet coefficients and energy map must have matching batch and spatial dimensions")
-        b, _, h, w = x.shape
-        scale = self.weights(energy).to(dtype=x.dtype).unsqueeze(2)
-        return (x.reshape(b, 4, 3, h, w) * scale).reshape_as(x)
-
-
-class SpatialWaveletLevelBlock(nn.Module):
-    """Estimate local energy and gate one unmodified Haar decomposition level."""
-
-    def __init__(self, in_ch=3, kernel_size=3, hidden_channels=16, beta=0.2):
-        super().__init__()
-        if in_ch != 3:
-            raise ValueError("spatial wavelet gating requires three channels per band")
-        self.energy = LocalSubbandEnergy(kernel_size)
-        self.gate = SpatialSubbandGate(hidden_channels, beta)
-
-    def forward(self, subbands, image=None):
-        if len(subbands) != 4:
-            raise ValueError("expected Haar subbands in LL, LH, HL, HH order")
-        x = torch.cat(subbands, dim=1)
-        return self.gate(x, self.energy(x))
-
-
-class WaveletBranch(nn.Module):
-    """Wavelet branch producing multi-scale wavelet features W1, W2, W3 and W4 from the raw RGB image.
-
-    The raw input image is decomposed with a fixed 4-level 2D Haar transform. W1 retains
-    the original raw-image GRN when use_grn is enabled. W2-W4 use the original GRN
-    (gate_mode="global"), local-energy spatial gating (gate_mode="spatial"), or no
-    modulation (gate_mode="none"). No learned projection is applied within this branch:
-
-        - W1: (B, 4*in_ch, H/2, W/2)   - finest level (4*3=12 channels for RGB input)
-        - W2: (B, 4*in_ch, H/4, W/4)   - second level
-        - W3: (B, 4*in_ch, H/8, W/8)   - third level
-        - W4: (B, 4*in_ch, H/16, W/16) - fourth level
-
-    The four maps are returned as a tuple so that selector layers (e.g. ``Index``) can pick an individual
-    level downstream without recomputing the decomposition.
-
-    Attributes:
-        level1 (WaveletLevelBlock): Level-1 GRN scaling (W1).
-        level2-4 (nn.Module): Global GRN, spatial gate, or identity concatenation (W2-W4).
-
-    Examples:
-        >>> import torch
-        >>> from ultralytics.nn.modules import WaveletBranch
-        >>> m = WaveletBranch(in_ch=3)
-        >>> w1, w2, w3, w4 = m(torch.randn(1, 3, 640, 640))
-        >>> print(w1.shape, w2.shape, w3.shape, w4.shape)  # (1,12,320,320) (1,12,160,160) (1,12,80,80) (1,12,40,40)
-    """
-
-    def __init__(self, in_ch=3, use_grn=True, hidden_ratio=0.25, gate_mode="global", energy_kernel=3,
-                 gate_hidden=16, gate_beta=0.2):
-        """
-        Initializes the wavelet branch.
-
-        Args:
-            in_ch (int): Number of channels of the input image. Defaults to 3.
-            use_grn (bool): Whether to apply the subband-level GRN-v3 dynamic scaling. Defaults to True.
-            hidden_ratio (float): Hidden width ratio of the GRN bottleneck. Defaults to 0.25.
-            gate_mode (str): W2-W4 modulation: "global" (legacy), "spatial", or "none".
-            energy_kernel (int): Odd local energy window size for spatial mode.
-            gate_hidden (int): Spatial gate hidden channels.
-            gate_beta (float): Spatial gate residual amplitude.
-        """
-        super().__init__()
-        if gate_mode not in {"global", "spatial", "none"}:
-            raise ValueError("gate_mode must be 'global', 'spatial', or 'none'")
-        self.gate_mode = gate_mode
-        self.level1 = WaveletLevelBlock(in_ch, use_grn=use_grn, hidden_ratio=hidden_ratio)
-        if gate_mode == "spatial":
-            def make_level():
-                return SpatialWaveletLevelBlock(in_ch, energy_kernel, gate_hidden, gate_beta)
-        else:
-            def make_level():
-                return WaveletLevelBlock(in_ch, use_grn=use_grn and gate_mode == "global",
-                                         hidden_ratio=hidden_ratio)
-        self.level2 = make_level()
-        self.level3 = make_level()
-        self.level4 = make_level()
-
-        ll = torch.tensor([[1.0, 1.0], [1.0, 1.0]]) / 2.0
-        lh = torch.tensor([[1.0, -1.0], [1.0, -1.0]]) / 2.0
-        hl = torch.tensor([[1.0, 1.0], [-1.0, -1.0]]) / 2.0
-        hh = torch.tensor([[1.0, -1.0], [-1.0, 1.0]]) / 2.0
-        # (4, 1, 2, 2) Haar filters, non-persistent so they do not appear in the state dict
-        self.register_buffer("haar_filters", torch.stack([ll, lh, hl, hh]).unsqueeze(1), persistent=False)
-
-    def haar2d(self, x):
-        """
-        Performs a single-level 2D Haar wavelet decomposition.
-
-        Args:
-            x (torch.Tensor): Input feature map of shape (B, C, H, W).
-
-        Returns:
-            (tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]): The LL, LH, HL and HH sub-bands,
-                each of shape (B, C, H//2, W//2).
-        """
-        b, c, h, w = x.shape
-        if h % 2 != 0 or w % 2 != 0:
-            x = F.pad(x, (0, w % 2, 0, h % 2), mode="replicate")
-            b, c, h, w = x.shape
-        filters = self.haar_filters.repeat(c, 1, 1, 1).to(dtype=x.dtype)  # (4C, 1, 2, 2)
-        out = F.conv2d(x, filters, stride=2, groups=c)  # (B, 4C, H/2, W/2)
-        out = out.view(b, c, 4, h // 2, w // 2).permute(0, 2, 1, 3, 4)  # (B, 4, C, H/2, W/2)
-        return out[:, 0], out[:, 1], out[:, 2], out[:, 3]
-
-    def forward(self, x):
-        """
-        Run four fixed Haar levels; only the unmodified LL enters the next decomposition.
-
-        Args:
-            x (torch.Tensor): Raw input image of shape (B, 3, H, W).
-
-        Returns:
-            (tuple[torch.Tensor, ...]): W1, W2, W3 and W4, each with 4*in_ch channels.
-        """
-        ll1, lh1, hl1, hh1 = self.haar2d(x)  # H/2
-        ll2, lh2, hl2, hh2 = self.haar2d(ll1)  # H/4
-        ll3, lh3, hl3, hh3 = self.haar2d(ll2)  # H/8
-        ll4, lh4, hl4, hh4 = self.haar2d(ll3)  # H/16
-        w1 = self.level1((ll1, lh1, hl1, hh1), x)  # (B, 4*in_ch, H/2, W/2)
-        w2 = self.level2((ll2, lh2, hl2, hh2), x)  # (B, 4*in_ch, H/4, W/4)
-        w3 = self.level3((ll3, lh3, hl3, hh3), x)  # (B, 4*in_ch, H/8, W/8)
-        w4 = self.level4((ll4, lh4, hl4, hh4), x)  # (B, 4*in_ch, H/16, W/16)
-        return w1, w2, w3, w4
-
-
-class P1WaveletFusion(nn.Module):
-    """P1 + W1 concatenation fusion whose 1x1 convolution is an identity mapping at initialization.
-
-    Concatenates the shallow backbone feature P1 with the wavelet feature W1 along the channel dimension and
-    projects back to the P1 channel count. The first ``c_p1`` input channels of the 1x1 convolution are
-    initialized to the identity matrix and the wavelet channels to zero, so at initialization the module is an
-    exact identity mapping (P1' = P1) and pretrained weights are preserved.
-
-    Examples:
-        >>> import torch
-        >>> from ultralytics.nn.modules import P1WaveletFusion
-        >>> m = P1WaveletFusion(c_p1=64, c_w1=32)
-        >>> p1, w1 = torch.randn(1, 64, 320, 320), torch.randn(1, 32, 320, 320)
-        >>> out = m([p1, w1])
-        >>> print(out.shape)  # (1, 64, 320, 320)
-    """
-
-    def __init__(self, c_p1, c_w1, c_w1_proj=None, use_act=True):
-        """
-        Initializes the P1 + W1 fusion module.
-
-        Args:
-            c_p1 (int): Number of channels of the P1 backbone feature (also the output channels).
-            c_w1 (int): Number of channels of the W1 wavelet feature.
-            c_w1_proj (int | None): Projection channels for W1 after its independent conv. Defaults to ``c_w1``.
-            use_act (bool): Whether the W1 projection conv uses activation (SiLU). Defaults to True.
-        """
-        super().__init__()
-        c_w1_proj = c_w1_proj if c_w1_proj is not None else c_w1
-        self.w_proj = Conv(c_w1, c_w1_proj, 1, 1, act=use_act)
-        self.fuse = nn.Conv2d(c_p1 + c_w1_proj, c_p1, 1)
-        nn.init.zeros_(self.fuse.weight)
-        nn.init.zeros_(self.fuse.bias)
-        with torch.no_grad():
-            for i in range(c_p1):
-                self.fuse.weight[i, i, 0, 0] = 1.0
-
-    def forward(self, x):
-        """
-        Fuses P1 and W1.
-
-        Args:
-            x (list[torch.Tensor]): ``x[0]`` is P1 (B, c_p1, H, W), ``x[1]`` is W1 (B, c_w1, H, W).
-
-        Returns:
-            (torch.Tensor): Fused feature map of shape (B, c_p1, H, W).
-        """
-        p1, w1 = x
-        w1 = self.w_proj(w1)
-        return self.fuse(torch.cat([p1, w1], dim=1))

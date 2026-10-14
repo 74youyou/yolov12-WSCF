@@ -366,22 +366,17 @@ def get_flops(model, imgsz=640):
     try:
         model = de_parallel(model)
         p = next(model.parameters())
-        # Input channels: prefer the model's declared input channels. The first parameter is not always the
-        # stem convolution (e.g. a parameter-free layer may precede a module with more input channels).
-        ch = p.shape[1]
-        if isinstance(getattr(model, "yaml", None), dict) and model.yaml.get("ch"):
-            ch = model.yaml["ch"]
         if not isinstance(imgsz, list):
             imgsz = [imgsz, imgsz]  # expand if int/float
         try:
             # Use stride size for input tensor
             stride = max(int(model.stride.max()), 32) if hasattr(model, "stride") else 32  # max stride
-            im = torch.empty((1, ch, stride, stride), device=p.device)  # input image in BCHW format
+            im = torch.empty((1, p.shape[1], stride, stride), device=p.device)  # input image in BCHW format
             flops = thop.profile(deepcopy(model), inputs=[im], verbose=False)[0] / 1e9 * 2  # stride GFLOPs
             return flops * imgsz[0] / stride * imgsz[1] / stride  # imgsz GFLOPs
         except Exception:
             # Use actual image size for input tensor (i.e. required for RTDETR models)
-            im = torch.empty((1, ch, *imgsz), device=p.device)  # input image in BCHW format
+            im = torch.empty((1, p.shape[1], *imgsz), device=p.device)  # input image in BCHW format
             return thop.profile(deepcopy(model), inputs=[im], verbose=False)[0] / 1e9 * 2  # imgsz GFLOPs
     except Exception:
         return 0.0
